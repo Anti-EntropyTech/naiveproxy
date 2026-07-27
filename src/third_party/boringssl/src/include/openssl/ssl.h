@@ -2742,6 +2742,26 @@ OPENSSL_EXPORT int SSL_set1_client_key_shares(SSL *ssl,
                                               const uint16_t *group_ids,
                                               size_t num_group_ids);
 
+// SSL_set_reality_client_auth configures an XTLS/REALITY client handshake.
+// `public_key` is the server's 32-byte X25519 public key and `short_id` is the
+// zero-padded 8-byte client short ID. The connection must use TLS 1.3 and send
+// an X25519 key share. This function returns one on success and zero on error.
+//
+// This API is a BoringSSL extension maintained by aproxy-core. REALITY needs the
+// ephemeral X25519 private key and the serialized ClientHello at the same time,
+// which are intentionally not exposed by the generic BoringSSL API.
+#define BORINGSSL_HAS_REALITY_CLIENT 1
+OPENSSL_EXPORT int SSL_set_reality_client_auth(
+    SSL *ssl, const uint8_t public_key[32], const uint8_t short_id[8]);
+
+// SSL_get0_reality_auth_key returns the per-handshake 32-byte REALITY
+// authentication key. It is available from the custom certificate verification
+// callback after the ClientHello has been generated. The returned pointer is
+// owned by `ssl` and must not be retained. It returns one on success.
+OPENSSL_EXPORT int SSL_get0_reality_auth_key(const SSL *ssl,
+                                             const uint8_t **out_key,
+                                             size_t *out_len);
+
 // SSL_set1_server_supported_groups_hint, when `ssl` is a client, indicates that
 // the server is likely to support groups listed in `server_groups`, in order of
 // decreasing server preference. This function returns one on success and zero

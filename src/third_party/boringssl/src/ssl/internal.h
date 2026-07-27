@@ -2119,6 +2119,11 @@ struct SSL_HANDSHAKE {
   // session_id is the session ID in the ClientHello.
   InplaceVector<uint8_t, SSL_MAX_SSL_SESSION_ID_LENGTH> session_id;
 
+  // reality_auth_key authenticates the REALITY ClientHello and temporary
+  // server certificate. It is derived from the ephemeral X25519 key share.
+  uint8_t reality_auth_key[32] = {0};
+  bool reality_auth_key_valid = false;
+
   // grease_seed is the entropy for GREASE values.
   uint8_t grease_seed[ssl_grease_last_index + 1] = {0};
 
@@ -3371,6 +3376,12 @@ struct SSL_CONFIG {
 
   // crypto
   UniquePtr<SSLCipherPreferenceList> cipher_list;
+
+  // Per-connection XTLS/REALITY client authentication parameters. They are
+  // fixed-size to avoid adding handshake heap allocations.
+  bool reality_enabled = false;
+  uint8_t reality_public_key[32] = {0};
+  uint8_t reality_short_id[8] = {0};
 
   // This is used to hold the local certificate used (i.e. the server
   // certificate for a server or the client certificate for a client).

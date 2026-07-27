@@ -2099,6 +2099,29 @@ int SSL_set1_client_key_shares(SSL *ssl, const uint16_t *group_ids,
   return 1;
 }
 
+int SSL_set_reality_client_auth(SSL *ssl, const uint8_t public_key[32],
+                                const uint8_t short_id[8]) {
+  if (!ssl->config || ssl->server || public_key == nullptr ||
+      short_id == nullptr) {
+    return 0;
+  }
+  OPENSSL_memcpy(ssl->config->reality_public_key, public_key, 32);
+  OPENSSL_memcpy(ssl->config->reality_short_id, short_id, 8);
+  ssl->config->reality_enabled = true;
+  return 1;
+}
+
+int SSL_get0_reality_auth_key(const SSL *ssl, const uint8_t **out_key,
+                              size_t *out_len) {
+  if (out_key == nullptr || out_len == nullptr || ssl->s3->hs == nullptr ||
+      !ssl->s3->hs->reality_auth_key_valid) {
+    return 0;
+  }
+  *out_key = ssl->s3->hs->reality_auth_key;
+  *out_len = sizeof(ssl->s3->hs->reality_auth_key);
+  return 1;
+}
+
 int SSL_set1_server_supported_groups_hint(SSL *ssl,
                                           const uint16_t *server_groups,
                                           size_t num_server_groups) {

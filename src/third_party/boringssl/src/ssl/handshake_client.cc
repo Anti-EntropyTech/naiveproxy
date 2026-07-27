@@ -26,11 +26,13 @@
 #include <openssl/aead.h>
 #include <openssl/bn.h>
 #include <openssl/bytestring.h>
+#include <openssl/curve25519.h>
 #include <openssl/ec_key.h>
 #include <openssl/ecdsa.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/hpke.h>
+#include <openssl/hkdf.h>
 #include <openssl/md5.h>
 #include <openssl/mem.h>
 #include <openssl/rand.h>
@@ -216,6 +218,55 @@ bool ssl_write_client_hello_without_extensions(const SSL_HANDSHAKE *hs,
   return true;
 }
 
+static bool ssl_apply_reality_session_id(SSL_HANDSHAKE *hs,
+                                         Array<uint8_t> *msg) {
+  if (!hs->config->reality_enabled) {
+    return true;
+  }
+  SSL *const ssl = hs->ssl;
+  constexpr size_t kSessionIDOffset = 39;
+  constexpr size_t kSessionIDLength = 32;
+  if (!hs->reality_auth_key_valid || msg->size() < kSessionIDOffset +
+                                                    kSessionIDLength ||
+      (*msg)[kSessionIDOffset - 1] != kSessionIDLength) {
+    OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
+    return false;
+  }
+  for (size_t i = 0; i < kSessionIDLength; i++) {
+    if ((*msg)[kSessionIDOffset + i] != 0) {
+      OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
+      return false;
+    }
+  }
+
+  uint8_t plaintext[16] = {1, 8, 1, 0};
+  const uint64_t now = ssl_ctx_get_current_time(ssl->ctx.get()).tv_sec;
+  CRYPTO_store_u32_be(plaintext + 4, static_cast<uint32_t>(now));
+  OPENSSL_memcpy(plaintext + 8, hs->config->reality_short_id, 8);
+
+  UniquePtr<EVP_AEAD_CTX> aead(EVP_AEAD_CTX_new(
+      EVP_aead_aes_256_gcm(), hs->reality_auth_key,
+      sizeof(hs->reality_auth_key), EVP_AEAD_DEFAULT_TAG_LENGTH));
+  uint8_t ciphertext[kSessionIDLength];
+  size_t ciphertext_len = 0;
+  const bool ok =
+      aead != nullptr &&
+      EVP_AEAD_CTX_seal(aead.get(), ciphertext, &ciphertext_len,
+                        sizeof(ciphertext), ssl->s3->client_random + 20, 12,
+                        plaintext, sizeof(plaintext), msg->data(), msg->size()) &&
+      ciphertext_len == sizeof(ciphertext);
+  OPENSSL_cleanse(plaintext, sizeof(plaintext));
+  if (!ok) {
+    OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
+    return false;
+  }
+  OPENSSL_memcpy(msg->data() + kSessionIDOffset, ciphertext,
+                 sizeof(ciphertext));
+  hs->session_id.CopyFrom(Span(ciphertext));
+  OPENSSL_cleanse(ciphertext, sizeof(ciphertext));
+  return true;
+}
+
 bool ssl_add_client_hello(SSL_HANDSHAKE *hs) {
   SSL *const ssl = hs->ssl;
   ScopedCBB cbb;
@@ -228,7 +279,8 @@ bool ssl_add_client_hello(SSL_HANDSHAKE *hs) {
       !ssl_write_client_hello_without_extensions(hs, &body, type,
                                                  /*empty_session_id=*/false) ||
       !ssl_add_clienthello_tlsext(hs, &body, /*out_encoded=*/nullptr, type) ||
-      !ssl->method->finish_message(ssl, cbb.get(), &msg)) {
+      !ssl->method->finish_message(ssl, cbb.get(), &msg) ||
+      !ssl_apply_reality_session_id(hs, &msg)) {
     return false;
   }
 
@@ -350,6 +402,58 @@ bool ssl_accepts_server_certificate_auth(const SSL_HANDSHAKE *hs) {
                       [](const auto &cred) { return !cred->UsesPrivateKey(); });
 }
 
+static bool ssl_setup_reality_auth(SSL_HANDSHAKE *hs) {
+  if (!hs->config->reality_enabled) {
+    return true;
+  }
+  SSL *const ssl = hs->ssl;
+  if (SSL_is_dtls(ssl) || SSL_is_quic(ssl) || hs->selected_ech_config ||
+      hs->max_version < TLS1_3_VERSION) {
+    OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
+    return false;
+  }
+
+  SSLKeyShare *x25519 = nullptr;
+  for (const auto &key_share : hs->key_shares) {
+    if (key_share->GroupID() == SSL_GROUP_X25519) {
+      x25519 = key_share.get();
+      break;
+    }
+  }
+  if (x25519 == nullptr) {
+    OPENSSL_PUT_ERROR(SSL, SSL_R_MISSING_KEY_SHARE);
+    return false;
+  }
+
+  ScopedCBB private_key_cbb;
+  Array<uint8_t> private_key;
+  uint8_t shared_secret[32] = {0};
+  static const uint8_t kRealityInfo[] = {'R', 'E', 'A', 'L', 'I', 'T', 'Y'};
+  const bool ok =
+      CBB_init(private_key_cbb.get(), 32) &&
+      x25519->SerializePrivateKey(private_key_cbb.get()) &&
+      CBBFinishArray(private_key_cbb.get(), &private_key) &&
+      private_key.size() == 32 &&
+      X25519(shared_secret, private_key.data(),
+             hs->config->reality_public_key) &&
+      HKDF(hs->reality_auth_key, sizeof(hs->reality_auth_key), EVP_sha256(),
+           shared_secret, sizeof(shared_secret), ssl->s3->client_random, 20,
+           kRealityInfo, sizeof(kRealityInfo));
+  if (!private_key.empty()) {
+    OPENSSL_cleanse(private_key.data(), private_key.size());
+  }
+  OPENSSL_cleanse(shared_secret, sizeof(shared_secret));
+  if (!ok) {
+    OPENSSL_cleanse(hs->reality_auth_key, sizeof(hs->reality_auth_key));
+    OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
+    return false;
+  }
+  hs->reality_auth_key_valid = true;
+  hs->session_id.ResizeForOverwrite(SSL_MAX_SSL_SESSION_ID_LENGTH);
+  OPENSSL_memset(hs->session_id.data(), 0, hs->session_id.size());
+  return true;
+}
+
 static enum ssl_hs_wait_t do_start_connect(SSL_HANDSHAKE *hs) {
   SSL *const ssl = hs->ssl;
 
@@ -444,6 +548,7 @@ static enum ssl_hs_wait_t do_start_connect(SSL_HANDSHAKE *hs) {
   ssl_setup_client_certificate_type(hs);
   if (!ssl_setup_pre_shared_keys(hs) ||  //
       !ssl_setup_key_shares(hs, /*override_group_id=*/0) ||
+      !ssl_setup_reality_auth(hs) ||
       !ssl_setup_extension_permutation(hs) ||
       !ssl_encrypt_client_hello(hs, Span(ech_enc, ech_enc_len)) ||
       !ssl_add_client_hello(hs)) {
