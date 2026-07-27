@@ -1010,6 +1010,14 @@ int SSLClientSocketImpl::DoHandshakeComplete(int result) {
   if (alpn_len > 0) {
     std::string_view proto(reinterpret_cast<const char*>(alpn_proto), alpn_len);
     negotiated_protocol_ = NextProtoFromString(proto);
+  } else if (reality_config_.has_value()) {
+    // A REALITY server never negotiates ALPN: it wears the borrowed site's
+    // ServerHello and skips the negotiation that would fill in
+    // EncryptedExtensions. Falling back to HTTP/1.1 would cost the multiplexing
+    // that the padding protocol relies on, so assume HTTP/2, which is what such
+    // a server speaks. The ClientHello still advertises exactly what Chrome
+    // does, and EncryptedExtensions is encrypted, so this is not observable.
+    negotiated_protocol_ = NextProto::kProtoHTTP2;
   }
 
   RecordNegotiatedProtocol();
