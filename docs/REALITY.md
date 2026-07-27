@@ -162,6 +162,24 @@ fatal `illegal_parameter`（alert 47），客户端侧表现为 `ERR_SSL_PROTOCO
 字节，所以可以就地整段覆写成 HMAC-SHA512 而不破坏 DER 长度编码。换成 ECDSA（签名是变长
 DER）就做不到这一点。
 
+## REALITY 不协商 ALPN，客户端必须自己假定 HTTP/2
+
+第二处冲突，同样是实测撞出来的。REALITY 服务端跳过了 `processClientHello()`，而 ALPN 协商
+（`negotiateALPN` 和 `c.clientProtocol = selectedProto`）就写在那个被跳过的函数里，所以
+EncryptedExtensions 里永远没有选定协议。Xray 的服务端配置把 `NextProtos` 留成 `nil` 并注释
+"should be nil"，真正的原因是**它根本不会被读取**。
+
+后果：Chromium 拿不到 ALPN 就退回 HTTP/1.1，于是往隧道里写的是
+`CONNECT host:port HTTP/1.1`，而对面的 HTTP/2 服务器报 `bogus greeting`。这不只是连不通，
+即便勉强连通也会丢掉 HTTP/2 的多路复用——那是 padding 协议赖以生效的基础。
+
+修法在 `DoHandshakeComplete()`：当 REALITY 启用且没有协商出 ALPN 时，把
+`negotiated_protocol_` 直接置为 `kProtoHTTP2`。`http_proxy_connect_job.cc:597` 正是据此在
+`SpdyProxyClientSocket`（H2）和 `HttpProxyClientSocket`（H1）之间选择的。
+
+这样做没有指纹代价：ClientHello 仍然通告与 Chrome 完全相同的 ALPN 列表，而
+EncryptedExtensions 是加密的、长度也已被填充成真实站点的，观察者看不到服务端没选 ALPN。
+
 ## 不显而易见的约束
 
 - **SNI 不是地址。** 见上。忘了写 `host-resolver-rules` 会让你真的连到被借用的站点，
@@ -220,11 +238,17 @@ TLS 1.3 下 Certificate 消息是加密的，被动观察者看不到；主动�
   `clang++ -fsyntax-only -std=c++20 -Iinclude -I.`。上面那两处 API 漂移就是这样发现的。
 - CI 的 `linux (x64)` / `linux (x86)` 在 `225d1028` 上通过，且跑过 `tests/basic.sh`
   （naive 自身的端到端代理回归测试），说明改动没有破坏原有功能。
-- **已用真实二进制对真实 REALITY 服务端做过握手**（`1a784d30` 的构建产物 vs
-  `naive-reality-server`）。结果：**REALITY 认证成功**——服务端日志
-  `hs.c.conn == conn: true`，证明 session_id 认证载荷的推导与封装是正确的，
-  ClientHello 侧的补丁工作正常。握手随后死在 CertificateVerify 的签名算法上，
-  即上面那一节描述的冲突，修复补丁尚未经构建验证。
+- **已用真实二进制对真实 REALITY 服务端做过两轮联调**，对象是
+  `naive-reality-server`，每轮都推进了一层：
+
+  1. `1a784d30` 的产物：**REALITY 认证成功**（服务端 `hs.c.conn == conn: true`），证明
+     session_id 认证载荷的推导与封装正确。握手随后死在 CertificateVerify 的 Ed25519
+     签名算法上。
+  2. `8e69a17a` 的产物（含 Ed25519 补丁）：**TLS 握手完整通过**
+     （`isHandshakeComplete.Load(): true`）。随后暴露出 ALPN 的问题——客户端退回
+     HTTP/1.1，服务端报 `bogus greeting "CONNECT example.com:80 H"`。
+
+  ALPN 的修复（`72e94624`）尚未经构建验证，隧道建立之后的 padding 协商也还没验证过。
 
 ## 后续步骤
 
