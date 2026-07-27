@@ -1283,13 +1283,12 @@ ssl_verify_result_t SSLClientSocketImpl::VerifyRealityCert() {
     return ssl_verify_invalid;
   }
 
-  // The certificate is authenticated by the shared secret rather than by a
-  // certificate authority, so record it without any PKI-derived status.
+  // Authentication is complete. What follows only records the certificate so
+  // that GetSSLInfo() has something to report, and must not fail the
+  // connection: a REALITY server sends a blank self-signed Ed25519 certificate
+  // that exists to carry the MAC, with no subject, no issuer and a validity
+  // period starting in year one, which this parser is free to reject.
   server_cert_ = x509_util::CreateX509CertificateFromBuffers(certs);
-  if (!server_cert_) {
-    OpenSSLPutNetError(FROM_HERE, ERR_SSL_SERVER_CERT_BAD_FORMAT);
-    return ssl_verify_invalid;
-  }
   server_cert_verify_result_.Reset();
   server_cert_verify_result_.verified_cert = server_cert_;
   return ssl_verify_ok;
