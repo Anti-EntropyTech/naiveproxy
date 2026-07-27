@@ -5,17 +5,28 @@
 #ifndef NET_SSL_SSL_CONFIG_SERVICE_H_
 #define NET_SSL_SSL_CONFIG_SERVICE_H_
 
+#include <array>
+#include <map>
 #include <optional>
 #include <string_view>
 #include <vector>
 
 #include "base/observer_list.h"
+#include "net/base/host_port_pair.h"
 #include "net/base/net_export.h"
 #include "net/cert/x509_certificate.h"
 #include "net/ssl/ssl_config.h"
 #include "third_party/abseil-cpp/absl/container/flat_hash_set.h"
 
 namespace net {
+
+// XTLS/REALITY client authentication parameters for one server.
+struct NET_EXPORT RealityConfig {
+  // The server's X25519 public key.
+  std::array<uint8_t, 32> public_key = {};
+  // The zero-padded client short ID.
+  std::array<uint8_t, 8> short_id = {};
+};
 
 // Represents a given named group in TLS, used in supported_groups and
 // key_share.
@@ -107,6 +118,12 @@ struct NET_EXPORT SSLContextConfig {
 
   // Controls whether ECH is enabled.
   bool ech_enabled = true;
+
+  // Servers to authenticate with XTLS/REALITY instead of the public PKI. When a
+  // server appears here, the ClientHello sent to it carries a REALITY
+  // authentication payload in its session_id, and its certificate is verified
+  // against the derived auth key. REALITY cannot be combined with ECH.
+  std::map<HostPortPair, RealityConfig> reality_configs;
 
   // TLS Trust Anchor IDs that are configured as trusted, as a list of Trust
   // Anchor IDs in binary representation.

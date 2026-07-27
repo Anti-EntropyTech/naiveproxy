@@ -34,6 +34,7 @@
 #include "net/ssl/openssl_ssl_util.h"
 #include "net/ssl/ssl_client_session_cache.h"
 #include "net/ssl/ssl_config.h"
+#include "net/ssl/ssl_config_service.h"
 #include "net/traffic_annotation/network_traffic_annotation.h"
 #include "third_party/boringssl/src/include/openssl/base.h"
 #include "third_party/boringssl/src/include/openssl/ssl.h"
@@ -159,6 +160,10 @@ class NET_EXPORT_PRIVATE SSLClientSocketImpl
   ssl_verify_result_t VerifyCert();
   ssl_verify_result_t HandleVerifyResult();
 
+  // Authenticates the server's temporary certificate against the REALITY auth
+  // key derived during the ClientHello, in place of public PKI verification.
+  ssl_verify_result_t VerifyRealityCert();
+
   // Callback from the SSL layer that indicates the remote server is requesting
   // a certificate for this client.
   int ClientCertRequestCallback(SSL* ssl);
@@ -269,6 +274,10 @@ class NET_EXPORT_PRIVATE SSLClientSocketImpl
   std::unique_ptr<SocketBIOAdapter> transport_adapter_;
   const HostPortPair host_and_port_;
   SSLConfig ssl_config_;
+
+  // Set when this server is configured for REALITY authentication. Held by
+  // value because the context's config may be replaced at any time.
+  std::optional<RealityConfig> reality_config_;
 
   enum State {
     STATE_NONE,

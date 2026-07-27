@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -44,6 +45,7 @@
 #include "net/base/trace_constants.h"
 #include "net/base/url_util.h"
 #include "net/cert/cert_status_flags.h"
+#include "net/cert/asn1_util.h"
 #include "net/cert/cert_verifier.h"
 #include "net/cert/ct_verifier.h"
 #include "net/cert/sct_auditing_delegate.h"
@@ -68,7 +70,10 @@
 #include "third_party/boringssl/src/include/openssl/bytestring.h"
 #include "third_party/boringssl/src/include/openssl/err.h"
 #include "third_party/boringssl/src/include/openssl/evp.h"
+#include "third_party/boringssl/src/include/openssl/hmac.h"
 #include "third_party/boringssl/src/include/openssl/mem.h"
+#include "third_party/boringssl/src/include/openssl/pool.h"
+#include "third_party/boringssl/src/include/openssl/sha2.h"
 #include "third_party/boringssl/src/include/openssl/ssl.h"
 
 namespace net {
@@ -859,11 +864,25 @@ int SSLClientSocketImpl::Init() {
         host_and_port_, &client_cert_, &client_private_key_);
   }
 
+  const auto reality_it =
+      context_->config().reality_configs.find(host_and_port_);
+  if (reality_it != context_->config().reality_configs.end()) {
+    reality_config_ = reality_it->second;
+  }
+
   if (context_->config().ech_enabled) {
     // TODO(crbug.com/41482204): Enable this unconditionally.
     SSL_set_enable_ech_grease(ssl_.get(), 1);
   }
-  if (!ssl_config_.ech_config_list.empty()) {
+  // REALITY carries its authentication payload in the ClientHello session_id,
+  // which the ECH inner/outer ClientHello split would discard.
+  if (reality_config_.has_value()) {
+    if (!SSL_set_reality_client_auth(ssl_.get(),
+                                     reality_config_->public_key.data(),
+                                     reality_config_->short_id.data())) {
+      return ERR_UNEXPECTED;
+    }
+  } else if (!ssl_config_.ech_config_list.empty()) {
     DCHECK(context_->config().ech_enabled);
     net_log_.AddEvent(NetLogEventType::SSL_ECH_CONFIG_LIST, [&] {
       return base::DictValue().Set(
@@ -1090,6 +1109,10 @@ ssl_verify_result_t SSLClientSocketImpl::VerifyCert() {
     return HandleVerifyResult();
   }
 
+  if (reality_config_.has_value()) {
+    return VerifyRealityCert();
+  }
+
   // In this configuration, BoringSSL will perform exactly one certificate
   // verification, so there cannot be state from a previous verification.
   CHECK(!server_cert_);
@@ -1196,6 +1219,80 @@ void SSLClientSocketImpl::OnVerifyComplete(int result) {
   cert_verification_result_ = result;
   // In handshake phase. The parameter to OnHandshakeIOComplete is unused.
   OnHandshakeIOComplete(OK);
+}
+
+ssl_verify_result_t SSLClientSocketImpl::VerifyRealityCert() {
+  CHECK(!server_cert_);
+
+  // The REALITY server proves possession of the shared secret by signing its
+  // temporary certificate's Ed25519 public key with the derived auth key,
+  // storing the MAC in the certificate's signature field.
+  const uint8_t* auth_key = nullptr;
+  size_t auth_key_len = 0;
+  const STACK_OF(CRYPTO_BUFFER)* certs = SSL_get0_peer_certificates(ssl_.get());
+  if (!SSL_get0_reality_auth_key(ssl_.get(), &auth_key, &auth_key_len) ||
+      !certs || sk_CRYPTO_BUFFER_num(certs) < 1) {
+    OpenSSLPutNetError(FROM_HERE, ERR_SSL_SERVER_CERT_BAD_FORMAT);
+    return ssl_verify_invalid;
+  }
+
+  const CRYPTO_BUFFER* leaf = sk_CRYPTO_BUFFER_value(certs, 0);
+  const base::span<const uint8_t> der = x509_util::CryptoBufferAsSpan(leaf);
+
+  // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm,
+  //                            signatureValue BIT STRING }
+  CBS cert, body, tbs_certificate, signature_algorithm, signature;
+  CBS_init(&cert, der.data(), der.size());
+  uint8_t unused_bits = 0;
+  if (!CBS_get_asn1(&cert, &body, CBS_ASN1_SEQUENCE) || CBS_len(&cert) != 0 ||
+      !CBS_get_asn1_element(&body, &tbs_certificate, CBS_ASN1_SEQUENCE) ||
+      !CBS_get_asn1_element(&body, &signature_algorithm, CBS_ASN1_SEQUENCE) ||
+      !CBS_get_asn1(&body, &signature, CBS_ASN1_BITSTRING) ||
+      !CBS_get_u8(&signature, &unused_bits) || unused_bits != 0 ||
+      CBS_len(&signature) != SHA512_DIGEST_LENGTH) {
+    OpenSSLPutNetError(FROM_HERE, ERR_SSL_SERVER_CERT_BAD_FORMAT);
+    return ssl_verify_invalid;
+  }
+
+  std::string_view spki;
+  if (!asn1::ExtractSPKIFromDERCert(base::as_string_view(der), &spki)) {
+    OpenSSLPutNetError(FROM_HERE, ERR_SSL_SERVER_CERT_BAD_FORMAT);
+    return ssl_verify_invalid;
+  }
+  CBS spki_cbs;
+  CBS_init(&spki_cbs, base::as_byte_span(spki).data(), spki.size());
+  bssl::UniquePtr<EVP_PKEY> public_key(EVP_parse_public_key(&spki_cbs));
+  std::array<uint8_t, 32> raw_public_key = {};
+  size_t raw_public_key_len = raw_public_key.size();
+  if (!public_key || EVP_PKEY_id(public_key.get()) != EVP_PKEY_ED25519 ||
+      !EVP_PKEY_get_raw_public_key(public_key.get(), raw_public_key.data(),
+                                   &raw_public_key_len) ||
+      raw_public_key_len != raw_public_key.size()) {
+    OpenSSLPutNetError(FROM_HERE, ERR_SSL_SERVER_CERT_BAD_FORMAT);
+    return ssl_verify_invalid;
+  }
+
+  std::array<uint8_t, EVP_MAX_MD_SIZE> expected = {};
+  unsigned expected_len = 0;
+  if (!HMAC(EVP_sha512(), auth_key, auth_key_len, raw_public_key.data(),
+            raw_public_key.size(), expected.data(), &expected_len) ||
+      expected_len != SHA512_DIGEST_LENGTH ||
+      CRYPTO_memcmp(expected.data(), CBS_data(&signature),
+                    SHA512_DIGEST_LENGTH) != 0) {
+    OpenSSLPutNetError(FROM_HERE, ERR_CERT_AUTHORITY_INVALID);
+    return ssl_verify_invalid;
+  }
+
+  // The certificate is authenticated by the shared secret rather than by a
+  // certificate authority, so record it without any PKI-derived status.
+  server_cert_ = x509_util::CreateX509CertificateFromBuffers(certs);
+  if (!server_cert_) {
+    OpenSSLPutNetError(FROM_HERE, ERR_SSL_SERVER_CERT_BAD_FORMAT);
+    return ssl_verify_invalid;
+  }
+  server_cert_verify_result_.Reset();
+  server_cert_verify_result_.verified_cert = server_cert_;
+  return ssl_verify_ok;
 }
 
 ssl_verify_result_t SSLClientSocketImpl::HandleVerifyResult() {
