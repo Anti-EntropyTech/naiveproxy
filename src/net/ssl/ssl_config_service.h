@@ -26,6 +26,9 @@ struct NET_EXPORT RealityConfig {
   std::array<uint8_t, 32> public_key = {};
   // The zero-padded client short ID.
   std::array<uint8_t, 8> short_id = {};
+
+  // SSLContextConfig defaults its comparison, so this has to be comparable too.
+  bool operator==(const RealityConfig&) const = default;
 };
 
 // Represents a given named group in TLS, used in supported_groups and
