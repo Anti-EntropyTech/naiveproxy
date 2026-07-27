@@ -183,7 +183,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BUNDLE }}.tar.xz naive executable sha256 ${{ env.SHA256SUM }}
-          path: src/sha256sum.txt
+          path: |
+            src/sha256sum.txt
+            src/${{ env.BUNDLE }}.tar.xz
       - name: Upload naiveproxy assets
         if: ${{ github.event_name == 'release' }}
         run: gh release upload "${GITHUB_REF##*/}" ${{ env.BUNDLE }}.tar.xz --clobber
@@ -279,7 +281,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BUNDLE }} sha256 ${{ env.SHA256SUM }}
-          path: apk/sha256sum.txt
+          path: |
+            apk/sha256sum.txt
+            apk/app/build/outputs/apk/release/${{ env.BUNDLE }}
       - name: Upload naiveproxy assets
         if: ${{ github.event_name == 'release' }}
         working-directory: apk/app/build/outputs/apk/release
@@ -344,7 +348,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BUNDLE }}.zip naive executable sha256 ${{ env.SHA256SUM }}
-          path: src/sha256sum.txt
+          path: |
+            src/sha256sum.txt
+            src/${{ env.BUNDLE }}.zip
       - name: Upload naiveproxy assets
         if: ${{ github.event_name == 'release' }}
         run: gh release upload "${GITHUB_REF##*/}"  ${{ env.BUNDLE }}.zip --clobber
@@ -395,7 +401,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BUNDLE }}.tar.xz naive executable sha256 ${{ env.SHA256SUM }}
-          path: src/sha256sum.txt
+          path: |
+            src/sha256sum.txt
+            src/${{ env.BUNDLE }}.tar.xz
       - name: Upload naiveproxy assets
         if: ${{ github.event_name == 'release' }}
         run: gh release upload "${GITHUB_REF##*/}" ${{ env.BUNDLE }}.tar.xz --clobber
@@ -446,7 +454,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BUNDLE }}.tar.xz naive executable sha256 ${{ env.SHA256SUM }}
-          path: src/sha256sum.txt
+          path: |
+            src/sha256sum.txt
+            src/${{ env.BUNDLE }}.tar.xz
       - name: Upload naiveproxy assets
         if: ${{ github.event_name == 'release' }}
         run: gh release upload "${GITHUB_REF##*/}" ${{ env.BUNDLE }}.tar.xz --clobber
@@ -652,7 +662,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BUNDLE }}.tar.xz naive executable sha256 ${{ env.SHA256SUM }}
-          path: src/sha256sum.txt
+          path: |
+            src/sha256sum.txt
+            src/${{ env.BUNDLE }}.tar.xz
       - name: Upload naiveproxy assets
         if: ${{ github.event_name == 'release' }}
         run: gh release upload "${GITHUB_REF##*/}" ${{ env.BUNDLE }}.tar.xz --clobber
