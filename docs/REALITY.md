@@ -141,6 +141,27 @@ Xray 另外支持一个可选的 ML-DSA-65 签名，覆盖
 proxy 里的主机名**仅仅是 TLS SNI**。它应当指向一个被服务端借用的、与你无关的真实站点，
 所以服务器的真实地址必须通过 `host-resolver-rules` 单独给出。
 
+## REALITY 与 Chrome TLS 栈的一处协议冲突
+
+REALITY 服务端**硬编码用 Ed25519 签 CertificateVerify**
+（`handshake_server_tls13.go` 里 `hs.sigAlg = Ed25519`），不管客户端在
+`signature_algorithms` 里通告了什么。它之所以在 Xray 上能用，是因为 **Go 的 TLS 客户端只
+检查「这个算法我能不能验证」**；而 **BoringSSL 检查「这个算法我通告过没有」**，后者才符合
+RFC 8446 §4.4.3。
+
+Chromium 从不通告 Ed25519（`ssl_client_socket_impl.cc` 里的 `kVerifyPrefs` 和
+`kVerifyPrefsWithMlDsa` 都没有它），uTLS 的 Chrome 指纹同样没有。所以未打补丁时握手会死在
+`extensions.cc` 的 `tls12_check_peer_sigalg`，报 `SSL_R_WRONG_SIGNATURE_TYPE`（245）并发出
+fatal `illegal_parameter`（alert 47），客户端侧表现为 `ERR_SSL_PROTOCOL_ERROR`（-107）。
+
+补丁的做法是**在 REALITY 启用时容忍这个算法，而不是去通告它**——通告会改变 ClientHello 的
+`signature_algorithms`，从而改变 JA3/JA4 指纹，那正是本项目要避免的。放宽这个检查不损失
+安全性：证书是靠它携带的 MAC 认证的，不是靠这个签名。
+
+顺带一个设计观察：REALITY 用 Ed25519 不是随意选的，而是**承重的**——Ed25519 签名恒为 64
+字节，所以可以就地整段覆写成 HMAC-SHA512 而不破坏 DER 长度编码。换成 ECDSA（签名是变长
+DER）就做不到这一点。
+
 ## 不显而易见的约束
 
 - **SNI 不是地址。** 见上。忘了写 `host-resolver-rules` 会让你真的连到被借用的站点，
@@ -171,26 +192,50 @@ proxy 里的主机名**仅仅是 TLS SNI**。它应当指向一个被服务端�
 
 如果将来的导入重新引入了 `SSLImpl` / `ImplType`，请从参考补丁恢复上游写法。
 
+## 服务端临时证书的实测形态
+
+REALITY 服务端在认证成功后发的那张证书（`signedCert`，在 `init()` 里生成，**每进程一次**，
+不是每连接、也不是编译期常量）实测为：
+
+| | |
+| --- | --- |
+| 大小 | **178 字节**（启用 ML-DSA-65 时 3509 字节） |
+| 主体 / 颁发者 | 都是空字符串 |
+| 序列号 | 0 |
+| 有效期起始 | 0001-01-01 |
+| 公钥算法 | Ed25519 |
+| 签名字段 | 64 字节，被覆写为 `HMAC-SHA512(AuthKey, 公钥)` |
+
+它是一张**几乎完全空白的自签证书**，任何 PKI 校验都会立刻拒绝。这不成问题，因为
+TLS 1.3 下 Certificate 消息是加密的，被动观察者看不到；主动探测者没有密钥，会被转发到真站点，
+也到不了这条路径。它只会被已通过认证的客户端看到，所以不需要装得像真的。
+
+由此得出一个实现要求：**客户端不能因为解析不出这张证书而否决连接**。本实现在 MAC 校验通过后
+仍会尝试构造 `X509Certificate`（只为让 `GetSSLInfo()` 有内容可报），但失败时不影响连接。
+
 ## 已执行的验证
 
 - 打过补丁的 BoringSSL 中，每个 `ssl/*.cc` 都能在
   `src/third_party/boringssl/src` 下通过
   `clang++ -fsyntax-only -std=c++20 -Iinclude -I.`。上面那两处 API 漂移就是这样发现的。
-- Chromium 侧的文件**未**在本地编译；工具链由 `src/get-clang.sh` 拉取，构建在推送到
-  `master` 时由 GitHub Actions 执行。
-- 尚未对任何真实的 REALITY 服务端尝试过握手。
+- CI 的 `linux (x64)` / `linux (x86)` 在 `225d1028` 上通过，且跑过 `tests/basic.sh`
+  （naive 自身的端到端代理回归测试），说明改动没有破坏原有功能。
+- **已用真实二进制对真实 REALITY 服务端做过握手**（`1a784d30` 的构建产物 vs
+  `naive-reality-server`）。结果：**REALITY 认证成功**——服务端日志
+  `hs.c.conn == conn: true`，证明 session_id 认证载荷的推导与封装是正确的，
+  ClientHello 侧的补丁工作正常。握手随后死在 CertificateVerify 的签名算法上，
+  即上面那一节描述的冲突，修复补丁尚未经构建验证。
 
 ## 后续步骤
 
-1. 让 CI 构建通过。
-2. 把客户端指向一个 **Xray** 的 REALITY 服务端作为测试桩。握手和 REALITY 认证应当成功；
-   内层协议会失败，因为 Xray 期待的是 VLESS，而 naive 发送的是 HTTP/2 `CONNECT`。握手成功
-   即足以验证本补丁序列。
-3. 构建 REALITY 服务端。预期形态是一个 REALITY + HTTP/2 前置，把 `CONNECT` 转发给一个
-   明文的 naive 服务端后端（`naive --listen=http://127.0.0.1:8080`），复用 naive 的
-   padding 实现而不是重新实现它。注意 naive 自己的服务端侧是明文 HTTP/1.1
-   （`http_proxy_server_socket.cc` 中的 `kResponseHeader`），设计上要坐在一个 TLS/H2 前置
-   之后。
+1. 等含 Ed25519 签名算法补丁的构建产出，重跑联调。复现步骤：服务端用
+   `naive-reality-server` 配一个可用的 `dest`（如 `dl.google.com:443`），客户端配置
+   见上面「用法」一节，加上 `"host-resolver-rules": "MAP <SNI> 127.0.0.1"` 指向本机，
+   然后经客户端的 SOCKS 端口发一次请求。
+2. 失败时用 `"log-net-log": "<path>"` 抓 NetLog，里面会给出 BoringSSL 的
+   `file`/`line`/`error_reason`，比 stderr 上那句 `handshake failed` 有用得多。诊断
+   上面那处签名算法冲突就是靠它定位的。
+3. REALITY 服务端已经实现完成，是一个独立的 Go 项目，不再需要 naive 作为后端。
 
 ## 参考实现
 
