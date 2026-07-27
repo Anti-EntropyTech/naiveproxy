@@ -4,8 +4,11 @@
 #include "net/tools/naive/naive_config.h"
 
 #include <algorithm>
+#include <array>
 #include <iostream>
 
+#include "base/base64url.h"
+#include "base/containers/span.h"
 #include "base/strings/escape.h"
 #include "base/strings/string_number_conversions.h"
 #include "base/strings/string_tokenizer.h"
@@ -22,6 +25,31 @@ ProxyServer MyProxyUriToProxyServer(std::string_view uri) {
                                                uri.substr(7));
   }
   return ProxyUriToProxyServer(uri, ProxyServer::SCHEME_INVALID);
+}
+
+// The REALITY public key is the server's X25519 public key, base64url encoded
+// without padding, as printed by `xray x25519`.
+bool ParseRealityPublicKey(const std::string& str,
+                           std::array<uint8_t, 32>* out) {
+  std::string decoded;
+  if (!base::Base64UrlDecode(str, base::Base64UrlDecodePolicy::DISALLOW_PADDING,
+                             &decoded) ||
+      decoded.size() != out->size()) {
+    return false;
+  }
+  base::span(*out).copy_from(base::as_byte_span(decoded));
+  return true;
+}
+
+// The REALITY short ID is up to 8 bytes of hex, zero padded on the right.
+bool ParseRealityShortId(const std::string& str, std::array<uint8_t, 8>* out) {
+  std::vector<uint8_t> bytes;
+  if (str.size() > out->size() * 2 || str.size() % 2 != 0 ||
+      !base::HexStringToBytes(str, &bytes)) {
+    return false;
+  }
+  base::span(*out).first(bytes.size()).copy_from(base::span(bytes));
+  return true;
 }
 }  // namespace
 
@@ -257,6 +285,48 @@ bool NaiveConfig::Parse(const base::DictValue& value) {
       }
       proxy_chains.push_back(proxy_chain);
     }
+  }
+
+  if (const base::Value* v = value.Find("reality-public-key")) {
+    const std::string* str = v->GetIfString();
+    if (!str) {
+      std::cerr << "Invalid reality-public-key" << std::endl;
+      return false;
+    }
+    RealityConfig reality;
+    if (!ParseRealityPublicKey(*str, &reality.public_key)) {
+      std::cerr << "Invalid reality-public-key: expected 32 bytes encoded as "
+                   "unpadded base64url"
+                << std::endl;
+      return false;
+    }
+    if (const base::Value* sv = value.Find("reality-short-id")) {
+      const std::string* short_id = sv->GetIfString();
+      if (!short_id || !ParseRealityShortId(*short_id, &reality.short_id)) {
+        std::cerr << "Invalid reality-short-id: expected at most 16 hex digits"
+                  << std::endl;
+        return false;
+      }
+    }
+    if (proxy_chains.empty()) {
+      std::cerr << "reality-public-key requires a proxy" << std::endl;
+      return false;
+    }
+    for (const ProxyChain& proxy_chain : proxy_chains) {
+      const ProxyServer& last =
+          proxy_chain.GetProxyServer(proxy_chain.length() - 1);
+      // REALITY authenticates a TLS 1.3 handshake, so the tunnel to the Naive
+      // server has to be TLS over TCP.
+      if (!last.is_https()) {
+        std::cerr << "REALITY requires an https proxy as the last server"
+                  << std::endl;
+        return false;
+      }
+      reality_configs[last.host_port_pair()] = reality;
+    }
+  } else if (value.Find("reality-short-id")) {
+    std::cerr << "reality-short-id requires reality-public-key" << std::endl;
+    return false;
   }
 
   if (const base::Value* v = value.Find("host-resolver-rules")) {

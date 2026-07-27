@@ -20,6 +20,7 @@
 #include "net/base/ip_address.h"
 #include "net/base/proxy_chain.h"
 #include "net/http/http_request_headers.h"
+#include "net/ssl/ssl_config_service.h"
 #include "net/tools/naive/naive_protocol.h"
 #include "url/scheme_host_port.h"
 
@@ -57,6 +58,12 @@ struct NaiveConfig {
   std::vector<ProxyChain> proxy_chains;
   std::set<url::SchemeHostPort> origins_to_force_quic_on;
   std::map<url::SchemeHostPort, AuthCredentials> auth_store;
+
+  // Authenticates the last server of every proxy chain with REALITY. The chain's
+  // hostname is sent as the ClientHello SNI and is expected to name an unrelated
+  // real site, so it usually has to be pointed at the actual server with
+  // `host_resolver_rules`.
+  std::map<HostPortPair, RealityConfig> reality_configs;
 
   std::string host_resolver_rules;
 

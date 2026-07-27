@@ -250,16 +250,22 @@ std::unique_ptr<URLRequestContext> BuildURLRequestContext(
       config.extra_headers,
       std::vector<PaddingType>{PaddingType::kVariant1, PaddingType::kNone}));
 
-  if (config.no_post_quantum == true) {
-    struct NoPostQuantum : public SSLConfigService {
+  if (config.no_post_quantum == true || !config.reality_configs.empty()) {
+    struct NaiveSSLConfigService : public SSLConfigService {
+      bool no_post_quantum = false;
+      std::map<HostPortPair, RealityConfig> reality_configs;
+
       SSLContextConfig GetSSLContextConfig() override {
         SSLContextConfig config;
-        std::erase_if(
-            config.supported_named_groups, [](const SSLNamedGroupInfo& g) {
-              return g.group_id == SSL_GROUP_X25519_MLKEM768 ||
-                     g.group_id == SSL_GROUP_X25519_KYBER768_DRAFT00 ||
-                     g.group_id == SSL_GROUP_MLKEM1024;
-            });
+        if (no_post_quantum) {
+          std::erase_if(
+              config.supported_named_groups, [](const SSLNamedGroupInfo& g) {
+                return g.group_id == SSL_GROUP_X25519_MLKEM768 ||
+                       g.group_id == SSL_GROUP_X25519_KYBER768_DRAFT00 ||
+                       g.group_id == SSL_GROUP_MLKEM1024;
+              });
+        }
+        config.reality_configs = reality_configs;
         return config;
       }
 
@@ -267,7 +273,10 @@ std::unique_ptr<URLRequestContext> BuildURLRequestContext(
         return false;
       }
     };
-    builder.set_ssl_config_service(std::make_unique<NoPostQuantum>());
+    auto ssl_config_service = std::make_unique<NaiveSSLConfigService>();
+    ssl_config_service->no_post_quantum = config.no_post_quantum == true;
+    ssl_config_service->reality_configs = config.reality_configs;
+    builder.set_ssl_config_service(std::move(ssl_config_service));
   }
 
   auto context = builder.Build();
@@ -421,6 +430,8 @@ int main(int argc, char* argv[]) {
                  "--tunnel-timeout=<SECONDS> Rotate tunnels after timeout\n"
                  "--idle-timeout=<SECONDS>   Close idle streams after timeout\n"
                  "--extra-headers=...        Extra headers split by CRLF\n"
+                 "--reality-public-key=...   REALITY server public key\n"
+                 "--reality-short-id=...     REALITY client short ID\n"
                  "--host-resolver-rules=...  Resolver rules\n"
                  "--resolver-range=...       Redirect resolver range\n"
                  "--log[=<path>]             Log to stderr, or file\n"

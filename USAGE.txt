@@ -107,6 +107,29 @@ Options:
     Appends extra headers in requests to the proxy server.
     Multiple headers are separated by CRLF.
 
+  --reality-public-key=PUBLIC-KEY
+
+    Authenticates the proxy server with XTLS/REALITY instead of the public
+    PKI. PUBLIC-KEY is the server's X25519 public key, base64url encoded
+    without padding.
+
+    The authentication payload is carried in the ClientHello session_id, so
+    the hostname in --proxy is only used as the TLS SNI and should name an
+    unrelated real site that the server borrows. The server's own address has
+    to be supplied separately, e.g.:
+
+      --proxy=https://user:pass@www.example.com
+      --reality-public-key=<PUBLIC-KEY>
+      --host-resolver-rules="MAP www.example.com 1.2.3.4"
+
+    Requires an https proxy as the last server in the chain. Cannot be
+    combined with ECH.
+
+  --reality-short-id=SHORT-ID
+
+    The REALITY client short ID, as at most 16 hex digits. Optional, and
+    defaults to empty. Requires --reality-public-key.
+
   --host-resolver-rules="MAP proxy.example.com 1.2.3.4"
 
     Statically resolves a domain name to an IP address.
