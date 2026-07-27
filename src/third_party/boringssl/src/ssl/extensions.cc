@@ -357,7 +357,17 @@ bool tls12_check_peer_sigalg(const SSL_HANDSHAKE *hs, uint8_t *out_alert,
   // The peer must have selected an algorithm that is consistent with its public
   // key, the TLS version, and what we advertised.
   Span<const uint16_t> sigalgs = tls12_get_verify_sigalgs(hs);
-  if (std::find(sigalgs.begin(), sigalgs.end(), sigalg) == sigalgs.end() ||
+  bool advertised =
+      std::find(sigalgs.begin(), sigalgs.end(), sigalg) != sigalgs.end();
+  // A REALITY server always signs with Ed25519, whether or not the client
+  // offered it. Its temporary certificate is authenticated by the MAC that the
+  // certificate carries rather than by this signature, so tolerating the
+  // algorithm costs nothing, while advertising it would change the ClientHello.
+  if (!advertised && hs->config->reality_enabled &&
+      sigalg == SSL_SIGN_ED25519) {
+    advertised = true;
+  }
+  if (!advertised ||
       !ssl_pkey_supports_algorithm(hs->ssl, pkey, sigalg, /*is_verify=*/true)) {
     OPENSSL_PUT_ERROR(SSL, SSL_R_WRONG_SIGNATURE_TYPE);
     *out_alert = SSL_AD_ILLEGAL_PARAMETER;
