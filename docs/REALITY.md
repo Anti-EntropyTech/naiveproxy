@@ -6,10 +6,10 @@
 
 | 部分 | 状态 |
 | --- | --- |
-| BoringSSL ClientHello 认证 | 已实现，已通过语法检查 |
-| Chromium 证书校验 | 已实现，**未在本地编译验证** |
-| naive 配置选项 | 已实现 |
-| 对真实服务端的握手测试 | **未做** |
+| BoringSSL ClientHello 认证 | 已实现，已验证 |
+| Chromium 证书校验 | 已实现，已验证 |
+| naive 配置选项 | 已实现，已验证 |
+| 对真实服务端的端到端联调 | **已通过**，含 HTTP、HTTPS 隧道、1 MB 传输 |
 | REALITY 服务端 | 独立项目，不在本仓库 |
 
 整个改动由三个 commit 承载：
@@ -247,19 +247,40 @@ TLS 1.3 下 Certificate 消息是加密的，被动观察者看不到；主动�
   2. `8e69a17a` 的产物（含 Ed25519 补丁）：**TLS 握手完整通过**
      （`isHandshakeComplete.Load(): true`）。随后暴露出 ALPN 的问题——客户端退回
      HTTP/1.1，服务端报 `bogus greeting "CONNECT example.com:80 H"`。
+  3. `f50e4ff9` 的产物（含 ALPN 补丁）：**全链路打通。** 客户端日志
+     `negotiated padding type: Variant1` 与 `Connection closed: OK`；实测三种流量都成功、
+     两侧零错误：
 
-  ALPN 的修复（`72e94624`）尚未经构建验证，隧道建立之后的 padding 协商也还没验证过。
+     | 场景 | 结果 |
+     | --- | --- |
+     | `http://example.com/` | 200，559 字节，内容正确 |
+     | `https://www.cloudflare.com/`（CONNECT 到 443） | 200，1,299,053 字节 |
+     | 1 MB 二进制下载 | 200，精确 1,048,576 字节 |
 
-## 后续步骤
+     最后一项尤其关键：1 MB 远超前 8 帧的加 padding 范围，字节精确到达说明
+     **「第 8 帧之后停止封包」这个边界在 C++ 客户端与 Go 服务端两侧的计数完全一致**。
+     如果帧格式或计数有任何偏差，数据会直接损坏而不是安然通过。
 
-1. 等含 Ed25519 签名算法补丁的构建产出，重跑联调。复现步骤：服务端用
-   `naive-reality-server` 配一个可用的 `dest`（如 `dl.google.com:443`），客户端配置
-   见上面「用法」一节，加上 `"host-resolver-rules": "MAP <SNI> 127.0.0.1"` 指向本机，
-   然后经客户端的 SOCKS 端口发一次请求。
-2. 失败时用 `"log-net-log": "<path>"` 抓 NetLog，里面会给出 BoringSSL 的
-   `file`/`line`/`error_reason`，比 stderr 上那句 `handshake failed` 有用得多。诊断
-   上面那处签名算法冲突就是靠它定位的。
-3. REALITY 服务端已经实现完成，是一个独立的 Go 项目，不再需要 naive 作为后端。
+  至此客户端补丁序列已端到端验证完毕。
+
+## 如何复现联调
+
+服务端用 `naive-reality-server` 配一个可用的 `dest`（如 `dl.google.com:443`），客户端配置见
+上面「用法」一节，加上 `"host-resolver-rules": "MAP <SNI> 127.0.0.1"` 指向本机，然后经客户端
+的 SOCKS 端口发请求。
+
+**排错时先加 `"log-net-log": "<path>"`。** stderr 上只有一句 `handshake failed`，而 NetLog
+会给出 BoringSSL 的 `file` / `line` / `error_reason`——上面那处签名算法冲突就是靠它定位的
+（`extensions.cc:362`，`error_reason: 245` = `SSL_R_WRONG_SIGNATURE_TYPE`）。
+
+## 后续可做的改进
+
+- **让 preamble 拿到像样的响应。** naive 会在 CONNECT 之前发真实的 GET/HEAD 请求
+  （`preamble_getter.cc`），目的是让连接开头的帧看起来像一次页面加载。目前
+  `naive-reality-server` 对非 CONNECT 请求回 405，响应很短，起不到伪装作用。更好的做法是把
+  这类请求转发给被借用的站点，让 preamble 得到一个真实页面的响应。
+- **启动时校验 dest。** 现在配了一个不可用的 dest（例如 Certificate 记录超过 8192）时，
+  回落路径看起来是正常的，只有认证路径静默失败。启动时主动探测一次并拒绝启动会好得多。
 
 ## 参考实现
 
