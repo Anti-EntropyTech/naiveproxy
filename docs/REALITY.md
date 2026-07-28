@@ -273,12 +273,27 @@ TLS 1.3 下 Certificate 消息是加密的，被动观察者看不到；主动�
 会给出 BoringSSL 的 `file` / `line` / `error_reason`——上面那处签名算法冲突就是靠它定位的
 （`extensions.cc:362`，`error_reason: 245` = `SSL_R_WRONG_SIGNATURE_TYPE`）。
 
+## 关于 preamble：在 REALITY 部署下不需要处理
+
+naive 会在新建隧道时先发真实的 GET/HEAD 请求（`preamble_getter.cc`），后续连接还会经
+`url_getter->StartOne()` 继续往同一条 H2 连接上追加，目的是让连接看起来像在浏览网站而不是
+只开隧道。`naive-reality-server` 对这些非 CONNECT 请求回 405。
+
+**这不需要修，理由有三个：**
+
+1. 探测抵抗完全由 REALITY 在 TLS 层承担——没有密钥的一方根本过不了握手，会被转发到真实
+   站点，永远看不到这个 405。它只会被已通过认证的客户端看到。
+2. 功能上无害：`naive_proxy.cc:186` 明确写了 `// Preamble error doesn't prevent Connect()`，
+   preamble 失败只记一条 warning。
+3. 唯一泄漏的是加密后的记录长度，而整个会话的形态由随后数小时的隧道流量主导。为几条
+   preamble 流的长度分布做工程，是在打磨已经足够强的那一环。
+
+反过来，把这些请求转发给被借用的站点还会引入一个真实风险：preamble 请求的头部会被送往第三方
+站点，一旦头部过滤有误，`Proxy-Authorization` 或 padding 头就泄漏给了那个站点——这比一个
+乏味的 405 糟糕得多。
+
 ## 后续可做的改进
 
-- **让 preamble 拿到像样的响应。** naive 会在 CONNECT 之前发真实的 GET/HEAD 请求
-  （`preamble_getter.cc`），目的是让连接开头的帧看起来像一次页面加载。目前
-  `naive-reality-server` 对非 CONNECT 请求回 405，响应很短，起不到伪装作用。更好的做法是把
-  这类请求转发给被借用的站点，让 preamble 得到一个真实页面的响应。
 - **启动时校验 dest。** 现在配了一个不可用的 dest（例如 Certificate 记录超过 8192）时，
   回落路径看起来是正常的，只有认证路径静默失败。启动时主动探测一次并拒绝启动会好得多。
 
